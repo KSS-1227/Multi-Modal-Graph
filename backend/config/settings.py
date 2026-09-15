@@ -93,7 +93,10 @@ MMKG_NAME      = os.environ.get("MMKG_NAME",      "example_mmkg")
 ENTITY_EXTRACT_MAX_GLEANING  = int(os.environ.get("ENTITY_EXTRACT_MAX_GLEANING",  "0"))
 ENTITY_SUMMARY_MAX_TOKENS    = int(os.environ.get("ENTITY_SUMMARY_MAX_TOKENS",    "500"))
 SUMMARY_CONTEXT_MAX_TOKENS   = int(os.environ.get("SUMMARY_CONTEXT_MAX_TOKENS",   "10000"))
-USE_MINERU = os.environ.get("USE_MINERU", "true").lower() in ("1", "true", "yes")
+# Default is False: PyMuPDF is fast enough for demo docs and requires no
+# subprocess warm-up.  Set USE_MINERU=true in .env only when layout-aware
+# parsing is visibly needed (e.g. complex multi-column PDFs with figures).
+USE_MINERU = os.environ.get("USE_MINERU", "false").lower() in ("1", "true", "yes")
 
 # ============ RAG Retrieval Configuration ============
 class QueryParam:

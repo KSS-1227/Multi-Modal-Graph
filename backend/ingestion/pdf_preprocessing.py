@@ -1,5 +1,35 @@
 """
 PDF ingestion: text chunking, PyMuPDF / MinerU parsing, image description.
+
+─── REGRESSION BENCHMARK (run before every demo) ────────────────────────────
+The scenario that was broken: uploading a small file after 5-10 prior uploads
+to the same workspace.  Repeat this exact sequence to catch regressions:
+
+  Step 1 — warm the workspace (do this once, results are cached):
+    Upload 5–10 varied PDFs via POST /api/workspace/upload with a Bearer token.
+    These can be the sample docs in examples/example_input/.
+
+  Step 2 — time the target upload:
+    curl -o /dev/null -s -w "%{time_total}s\n" \\
+      -X POST http://localhost:8000/api/workspace/upload \\
+      -H "Authorization: Bearer <token>" \\
+      -F "file=@examples/example_input/your_small.pdf" \\
+      -F "workspace_id=<workspace_id>"
+
+  Step 3 — acceptance thresholds:
+    • Text-only PDF (≤ 5 pages, 0 images):  < 15 s   (pure LLM + embed time)
+    • PDF with ≤ 10 images:                 < 40 s   (all images described in
+                                                       parallel via semaphore)
+    • Any result > 2× a fresh-workspace baseline → investigate before the demo.
+
+  What to check if it regresses:
+    • kv_store_text_chunks.json growing unboundedly in WORKING_DIR — sign that
+      prior uploads are not being deduplicated (see TextChunking.text_chunking).
+    • asyncio.Semaphore value: lower it (e.g. 8) if you hit OpenAI rate limits;
+      raise it (up to 20) if you have a Tier-4+ key and want more throughput.
+    • USE_MINERU=true accidentally set — each upload spawns a cold subprocess,
+      adding 20-60 s of warm-up latency.  Keep it false for the demo.
+─────────────────────────────────────────────────────────────────────────────
 """
 import asyncio
 import os
@@ -137,7 +167,6 @@ class PdfChunking:
         import fitz  # PyMuPDF
         doc          = fitz.open(self.pdf_path)
         texts        = []
-        image_data   = {}
         cache_kv     = JsonKVStorage(namespace="multimodel_llm_response_cache",
                                      storage_dir=parameter.CACHE_PATH)
 
@@ -147,13 +176,14 @@ class PdfChunking:
         text_chunks_all = load_json(
             os.path.join(self.working_dir, "kv_store_text_chunks.json")) or {}
 
+        # --- Phase 1: extract text and collect raw image records ---
+        raw_images = []  # list of (img_name, img_path, context)
         for page_num, page in enumerate(tqdm(doc, desc="📖 Parsing pages", unit="page")):
-            # Extract text
             page_text = page.get_text("text")
             if page_text.strip():
                 texts.append(page_text)
 
-            # Extract images
+            context = page_text[:500] if page_text else ""
             for img_index, img_ref in enumerate(page.get_images(full=True)):
                 xref       = img_ref[0]
                 base_image = doc.extract_image(xref)
@@ -163,31 +193,42 @@ class PdfChunking:
 
                 pil_img = Image.open(BytesIO(img_bytes)).convert("RGB")
                 compress_image_to_size(pil_img, img_path)
+                raw_images.append((img_name, img_path, context))
 
-                # Get surrounding text context
-                context = page_text[:500] if page_text else ""
+        doc.close()
+
+        # --- Phase 2: describe all images concurrently (≤ 16 in-flight at once) ---
+        # Matches the limit_async_func_call(16) pattern used in text2graph.py so
+        # we never open more than 16 simultaneous vision-LLM requests, avoiding
+        # rate-limit errors while still processing all images in parallel.
+        semaphore = asyncio.Semaphore(16)
+
+        async def _describe(img_name, img_path, context):
+            async with semaphore:
                 desc, seg = await get_image_description(
                     img_path, caption=[], footnote=[], context=context,
-                    hashing_kv=cache_kv
+                    hashing_kv=cache_kv,
                 )
+            chunk_id  = find_chunk_for_image(text_chunks_all, context)
+            chunk_idx = 0
+            if chunk_id and chunk_id in text_chunks_all:
+                chunk_idx = text_chunks_all[chunk_id].get("chunk_order_index", 0)
+            return img_name, {
+                "image_path":        img_path,
+                "description":       desc,
+                "segmentation":      seg,
+                "chunk_order_index": chunk_idx,
+            }
 
-                chunk_id = find_chunk_for_image(text_chunks_all, context)
-                chunk_idx = 0
-                if chunk_id and chunk_id in text_chunks_all:
-                    chunk_idx = text_chunks_all[chunk_id].get("chunk_order_index", 0)
-
-                image_data[img_name] = {
-                    "image_path":       img_path,
-                    "description":      desc,
-                    "segmentation":     seg,
-                    "chunk_order_index": chunk_idx,
-                }
+        tasks = [_describe(n, p, c) for n, p, c in raw_images]
+        logger.info(f"🖼️ Describing {len(tasks)} images concurrently (semaphore=16) …")
+        results = await asyncio.gather(*tasks)
+        image_data = dict(results)
 
         # Persist image data
         from ..utils.base import write_json
         write_json(image_data, os.path.join(self.working_dir, "kv_store_image_data.json"))
         await cache_kv.index_done_callback()
-        doc.close()
         return texts, list(image_data.keys())
 
     async def _process_mineru(self):
@@ -226,7 +267,9 @@ class PdfChunking:
             images_dir = os.path.join(self.working_dir, "images")
             os.makedirs(images_dir, exist_ok=True)
 
-            for idx, item in enumerate(tqdm(content_list, desc="🖼️ Processing images", unit="image")):
+            # --- Phase 1: compress images and collect metadata records ---
+            raw_images = []  # list of (img_name, img_dest, caption, footnote, context)
+            for idx, item in enumerate(tqdm(content_list, desc="🗜️ Compressing images", unit="image")):
                 if item.get("type") != "image":
                     continue
                 img_path_raw = item.get("img_path", "")
@@ -238,26 +281,39 @@ class PdfChunking:
                 pil_img = Image.open(img_path_raw).convert("RGB")
                 compress_image_to_size(pil_img, img_dest)
 
-                caption  = item.get("img_caption", [])
-                footnote = item.get("img_footnote", [])
-                context  = item.get("text_context", "")
+                raw_images.append((
+                    img_name,
+                    img_dest,
+                    item.get("img_caption", []),
+                    item.get("img_footnote", []),
+                    item.get("text_context", ""),
+                ))
 
-                desc, seg = await get_image_description(
-                    img_dest, caption=caption, footnote=footnote,
-                    context=context, hashing_kv=cache_kv
-                )
+            # --- Phase 2: describe all images concurrently (≤ 16 in-flight at once) ---
+            # Matches the limit_async_func_call(16) pattern used in text2graph.py.
+            semaphore = asyncio.Semaphore(16)
 
+            async def _describe(img_name, img_dest, caption, footnote, context):
+                async with semaphore:
+                    desc, seg = await get_image_description(
+                        img_dest, caption=caption, footnote=footnote,
+                        context=context, hashing_kv=cache_kv,
+                    )
                 chunk_id  = find_chunk_for_image(text_chunks_all, context)
                 chunk_idx = 0
                 if chunk_id and chunk_id in text_chunks_all:
                     chunk_idx = text_chunks_all[chunk_id].get("chunk_order_index", 0)
-
-                image_data[img_name] = {
+                return img_name, {
                     "image_path":        img_dest,
                     "description":       desc,
                     "segmentation":      seg,
                     "chunk_order_index": chunk_idx,
                 }
+
+            tasks = [_describe(*rec) for rec in raw_images]
+            logger.info(f"🖼️ Describing {len(tasks)} images concurrently (semaphore=16) …")
+            results = await asyncio.gather(*tasks)
+            image_data = dict(results)
 
             from ..utils.base import write_json
             write_json(image_data, os.path.join(self.working_dir, "kv_store_image_data.json"))
