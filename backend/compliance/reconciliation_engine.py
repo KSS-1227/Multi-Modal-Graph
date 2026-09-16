@@ -29,11 +29,15 @@ reason, never dropped silently.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
 
 # Reuse the shared async pool — do NOT open a second connection to CockroachDB.
 from backend.cockroach_graph_storage import _get_pool
+from backend.compliance.decision_lineage import LineageRow, persist_lineage
+
+logger = logging.getLogger(__name__)
 
 # Matches an optional currency symbol (rupee / dollar) followed by an
 # Indian- or Western-formatted number, e.g. "₹80,000", "$5,200", "1,00,000".
@@ -199,11 +203,18 @@ class ReconciliationEngine:
         approval_threshold: float | None,
         text_chunks: dict,
     ) -> dict:
-        """Reconcile a single invoice node into a result row."""
+        """Reconcile a single invoice node into a result row.
+
+        The returned dict contains a private ``_evidence_ids`` key (list of
+        node IDs that were consulted) used only for lineage persistence — it
+        is stripped before the row is included in the public API response.
+        """
         invoice_amount = _parse_amount(invoice.get("description"))
         contract_amount: float | None = None
         status: str
         reason: str | None = None
+        # Track every node ID touched during reconciliation for lineage.
+        evidence_ids: list[str] = [invoice_id]
 
         if invoice_amount is None:
             status, reason = "unresolved", "Could not parse amount from document"
@@ -212,12 +223,14 @@ class ReconciliationEngine:
             if vendor_id is None:
                 status, reason = "unresolved", "Invoice not linked to any vendor"
             else:
+                evidence_ids.append(vendor_id)
                 contract_id = self._find_neighbor_of_type(
                     vendor_id, "CONTRACT_AMOUNT", nodes, adjacency
                 )
                 if contract_id is None:
                     status, reason = "unresolved", "No matching vendor contract found"
                 else:
+                    evidence_ids.append(contract_id)
                     contract_amount = _parse_amount(nodes[contract_id].get("description"))
                     if contract_amount is None:
                         status = "unresolved"
@@ -246,6 +259,8 @@ class ReconciliationEngine:
             "contract_amount": contract_amount,
             "requires_approval": requires_approval,
             "source_files": self._source_files(invoice, text_chunks),
+            # Private — used for lineage only, stripped before API response.
+            "_evidence_ids": evidence_ids,
         }
 
     async def reconcile(self) -> dict:
@@ -291,11 +306,57 @@ class ReconciliationEngine:
         total = len(invoices)
         match_rate = f"{round((counts['matched'] / total) * 100)}%" if total else "0%"
 
+        # ------------------------------------------------------------------
+        # Lineage persistence — one batched INSERT for the whole run.
+        # Failures are logged and swallowed; the response is unaffected.
+        # ------------------------------------------------------------------
+        lineage_rows: list[LineageRow] = []
+        for row in results:
+            invoice_id  = row["invoice_id"]
+            status      = row["status"]
+            amount      = row.get("invoice_amount")
+            contract    = row.get("contract_amount")
+            reason      = row.get("reason")
+
+            if status == "matched":
+                conclusion = (
+                    f"{invoice_id} matched contract, "
+                    f"amount {_fmt(amount)} verified"
+                    if amount is not None
+                    else f"{invoice_id} matched contract"
+                )
+            elif status == "exception":
+                conclusion = reason or (
+                    f"{invoice_id} exception: amount {_fmt(amount) if amount else '?'} "
+                    f"exceeds contract limit {_fmt(contract) if contract else '?'}"
+                )
+            else:
+                conclusion = reason or f"{invoice_id} unresolved"
+
+            lineage_rows.append(LineageRow(
+                conclusion    = conclusion,
+                evidence_ids  = row.get("_evidence_ids", [invoice_id]),
+                decision_type = status,
+                confidence    = None,   # reconciliation engine does not compute a confidence score
+            ))
+
+        # Fire-and-forget: do not await, do not let it block or raise.
+        try:
+            await persist_lineage(self.workspace_id, self.workspace_id, lineage_rows)
+        except Exception as exc:  # pragma: no cover — belt-and-suspenders guard
+            logger.warning("reconcile: lineage persist raised unexpectedly: %s", exc)
+
+        # Strip the private _evidence_ids key before returning public response.
+        public_results = [
+            {k: v for k, v in row.items() if not k.startswith("_")}
+            for row in results
+        ]
+
         return {
-            "total": total,
-            "matched": counts["matched"],
+            "total":      total,
+            "matched":    counts["matched"],
             "exceptions": counts["exception"],
             "unresolved": counts["unresolved"],
             "match_rate": match_rate,
-            "results": results,
+            "results":    public_results,
         }

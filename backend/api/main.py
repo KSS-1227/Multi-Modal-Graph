@@ -25,6 +25,7 @@ from backend.api.routes.workspace_report import router as ws_report_router
 # Workspace-aware replacements (user-scoped paths — no global data folders)
 from backend.api.routes.workspace_stats import router as ws_stats_router
 from backend.api.routes.workspace_upload import router as ws_upload_router
+from backend.api.routes.workspace_decisions import router as ws_decisions_router
 from backend.auth.middleware.jwt_middleware import _get_jwks, get_current_user
 from backend.auth.routes.audit import router as audit_router
 from backend.auth.routes.auth import router as auth_router
@@ -107,6 +108,11 @@ app.include_router(
 )
 app.include_router(
     reconciliation_router,
+    prefix="/api",
+    dependencies=[Depends(get_current_user)],
+)
+app.include_router(
+    ws_decisions_router,
     prefix="/api",
     dependencies=[Depends(get_current_user)],
 )

@@ -55,3 +55,23 @@ CREATE TABLE IF NOT EXISTS agent_memory (
 
 CREATE INDEX IF NOT EXISTS agent_memory_workspace_session_idx
     ON agent_memory (workspace_id, session_id, turn);
+
+-- Decision lineage: one row per conclusion produced by the reconciliation engine.
+-- evidence_ids is stored as JSONB so individual IDs (node/edge/chunk) can be
+-- indexed later without a schema change.
+
+CREATE TABLE IF NOT EXISTS decision_lineage (
+    decision_id   UUID        NOT NULL DEFAULT gen_random_uuid(),
+    workspace_id  UUID        NOT NULL,
+    case_id       UUID        NOT NULL,
+    conclusion    STRING      NOT NULL,
+    evidence_ids  JSONB       NOT NULL DEFAULT '[]',
+    confidence    FLOAT8,
+    decision_type STRING      NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (workspace_id, decision_id)
+);
+
+-- Fast lookup by case and optional decision_type filter
+CREATE INDEX IF NOT EXISTS decision_lineage_case_idx
+    ON decision_lineage (workspace_id, case_id, created_at DESC);
