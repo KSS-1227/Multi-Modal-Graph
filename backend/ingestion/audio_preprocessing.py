@@ -24,7 +24,7 @@ images : List[dict]
 
 from __future__ import annotations
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from ..config import settings
 from ..utils.base import logger
@@ -41,9 +41,10 @@ class AudioChunking:
         self.audio_path = audio_path
         self.working_dir = working_dir
 
-        self.client = OpenAI(
+        # AsyncOpenAI so _transcribe() never blocks the event loop.
+        # Whisper must still reach api.openai.com directly — no base_url override.
+        self.client = AsyncOpenAI(
             api_key=settings.OPENAI_API_KEY or settings.API_KEY,
-            # No base_url override — Whisper must hit api.openai.com directly.
         )
 
     # ---------------------------------------------------------
@@ -56,11 +57,9 @@ class AudioChunking:
 
         logger.info("🎤 Processing Audio File...")
 
-        transcript = self._transcribe()
+        transcript = await self._transcribe()
 
-        texts = self._chunk_transcript(
-            transcript
-        )
+        texts = self._chunk_transcript(transcript)
 
         images = []
 
@@ -72,22 +71,16 @@ class AudioChunking:
         return texts, images
 
     # ---------------------------------------------------------
-    # OpenAI Speech-to-Text
+    # OpenAI Speech-to-Text  (async — never blocks event loop)
     # ---------------------------------------------------------
 
-    def _transcribe(self) -> str:
+    async def _transcribe(self) -> str:
 
-        with open(
-            self.audio_path,
-            "rb"
-        ) as audio:
+        with open(self.audio_path, "rb") as audio:
 
-            result = self.client.audio.transcriptions.create(
-
+            result = await self.client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
-
-                file=audio
-
+                file=audio,
             )
 
         return result.text

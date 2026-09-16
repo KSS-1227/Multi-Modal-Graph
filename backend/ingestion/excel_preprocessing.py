@@ -22,6 +22,8 @@ Compatible with:
 
 from __future__ import annotations
 
+import os
+
 from openpyxl import load_workbook
 
 from ..utils.base import logger
@@ -51,6 +53,17 @@ class ExcelChunking:
         texts = self._extract_text()
 
         images = []
+        # Embedded image extraction from Excel workbooks is not implemented.
+        # openpyxl can access worksheet images via ws._images but the objects
+        # do not expose raw bytes in a stable public API across versions.
+        # Images in Excel files are therefore silently dropped at this stage.
+        # If your workbooks contain compliance-relevant diagrams or charts,
+        # export them as PDFs or image files and upload those separately.
+        logger.warning(
+            "⚠️ [ExcelChunking] Embedded images in '%s' are not extracted — "
+            "Excel image ingestion is not yet implemented.  Only cell text is processed.",
+            os.path.basename(self.excel_path),
+        )
 
         logger.info(
             f"✅ Excel Parsed "

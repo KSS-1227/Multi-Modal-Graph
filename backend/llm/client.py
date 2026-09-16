@@ -120,18 +120,22 @@ async def model_if_cache(
     return content
 
 
-def get_llm_response(cur_prompt: str, system_content: str) -> str:
-    client = _get_client(is_async=False, is_multimodal=False)
-    completion = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": system_content},
-            {"role": "user",   "content": cur_prompt},
-        ],
-        max_tokens=4096,
-        frequency_penalty=0.3,
+async def get_llm_response(cur_prompt: str, system_content: str) -> str:
+    """Async text LLM call — uses the shared AsyncOpenAI client so it never
+    blocks the event loop.  All callers (fusion helpers) must ``await`` this."""
+    client = _get_client(is_async=True, is_multimodal=False)
+    response = await _with_retry(
+        lambda: client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_content},
+                {"role": "user",   "content": cur_prompt},
+            ],
+            max_tokens=4096,
+            frequency_penalty=0.3,
+        )
     )
-    return completion.choices[0].message.content
+    return response.choices[0].message.content
 
 
 # ============================================================================
@@ -182,20 +186,25 @@ async def multimodel_if_cache(
     return content
 
 
-def get_mmllm_response(cur_prompt: str, system_content: str, img_base: str) -> str:
-    client = _get_client(is_async=False, is_multimodal=True)
-    completion = client.chat.completions.create(
-        model=MM_MODEL_NAME,
-        messages=[
-            {"role": "system", "content": [{"type": "text", "text": system_content}]},
-            {"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base}"}},
-                {"type": "text", "text": cur_prompt},
-            ]},
-        ],
-        max_tokens=4096,
+async def get_mmllm_response(cur_prompt: str, system_content: str, img_base: str) -> str:
+    """Async multimodal LLM call — uses the shared AsyncOpenAI client so it
+    never blocks the event loop.  All callers (fusion helpers) must ``await``
+    this."""
+    client = _get_client(is_async=True, is_multimodal=True)
+    response = await _with_retry(
+        lambda: client.chat.completions.create(
+            model=MM_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": [{"type": "text", "text": system_content}]},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_base}"}},
+                    {"type": "text", "text": cur_prompt},
+                ]},
+            ],
+            max_tokens=4096,
+        )
     )
-    return completion.choices[0].message.content
+    return response.choices[0].message.content
 
 
 # ============================================================================

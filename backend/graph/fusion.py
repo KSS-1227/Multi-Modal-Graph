@@ -1,6 +1,22 @@
 """
 Knowledge-graph fusion: aligns image KGs with the text KG and merges them.
+
+Event-loop safety
+-----------------
+All CPU-bound work (embedding, DBSCAN, numpy linalg) is dispatched via
+``asyncio.get_event_loop().run_in_executor(None, ...)`` so it runs in a
+thread-pool worker instead of blocking the event loop.
+
+All LLM calls use the async ``get_llm_response`` / ``get_mmllm_response``
+wrappers (AsyncOpenAI) and are properly awaited.
+
+Silent-failure policy
+---------------------
+Every degraded-quality path (IMG_ENTITY fallback, empty entity list,
+alignment miss, missing GraphML) now emits a WARNING so operators see
+graph-quality issues in logs rather than discovering them at query time.
 """
+import asyncio
 import math
 import os
 
@@ -8,6 +24,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import base64
 import xml.etree.ElementTree as ET
+from functools import partial
 
 import networkx as nx
 import numpy as np
@@ -55,11 +72,7 @@ def get_nearby_entities(data: dict, index: int) -> list[dict]:
     entities = []
     for chunk_index in indices:
         entities.extend(
-            {
-                key: value
-                for key, value in entity.items()
-                if key != "source_id"
-            }
+            {key: value for key, value in entity.items() if key != "source_id"}
             for entity in data.get(str(chunk_index), {}).get("entities", [])
         )
     return entities
@@ -69,12 +82,8 @@ def get_nearby_relationships(data: dict, index: int) -> list[dict]:
     relationships = []
     for chunk_index in indices:
         relationships.extend(
-            {
-                key: value
-                for key, value in relationship.items()
-                if key != "source_id"
-            }
-            for relationship in data.get(str(chunk_index), {}).get("relationships", [])
+            {key: value for key, value in rel.items() if key != "source_id"}
+            for rel in data.get(str(chunk_index), {}).get("relationships", [])
         )
     return relationships
 
@@ -86,18 +95,21 @@ def _sanitize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     zero_mask = (norms < 1e-8)
     if zero_mask.any():
-        logger.warning(f"⚠️ Found {zero_mask.sum()} zero/near-zero vector embeddings")
-        embeddings[zero_mask.flatten()] = np.random.normal(0, 1e-6, size=(zero_mask.sum(), embeddings.shape[1]))
+        logger.warning("⚠️ Found %d zero/near-zero vector embeddings", zero_mask.sum())
+        embeddings[zero_mask.flatten()] = np.random.normal(
+            0, 1e-6, size=(zero_mask.sum(), embeddings.shape[1])
+        )
         norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     normalized = embeddings / np.maximum(norms, 1e-8)
     normalized = np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=-1.0)
     return normalized.astype(np.float64)
 
 # ============================================================================
-# Spectral clustering
+# Spectral clustering — CPU-bound, must run in executor
 # ============================================================================
 
 def _compute_spectral_labels(embeddings, entity_names, relationships):
+    """Pure CPU work — called via run_in_executor, NOT on the event loop."""
     normalized_embeddings = _sanitize_embeddings(embeddings)
     raw_similarity = np.dot(normalized_embeddings, normalized_embeddings.T)
     similarity_matrix = (raw_similarity + 1.0) / 2.0
@@ -132,7 +144,7 @@ def _compute_spectral_labels(embeddings, entity_names, relationships):
     try:
         eigvals, eigvecs = np.linalg.eigh(laplacian_matrix)
     except np.linalg.LinAlgError:
-        logger.warning("⚠️ Laplacian matrix eigen-decomposition failed, falling back to eig")
+        logger.warning("⚠️ Laplacian eigen-decomposition failed, falling back to eig")
         eigvals, eigvecs = np.linalg.eig(laplacian_matrix)
 
     eigvals = np.real(eigvals)
@@ -146,6 +158,7 @@ def _compute_spectral_labels(embeddings, entity_names, relationships):
 
 
 def _classify_by_nearest_neighbor(input_embeddings, reference_embeddings, labels, n_neighbors=1):
+    """Pure CPU work — called via run_in_executor, NOT on the event loop."""
     input_embeddings     = _sanitize_embeddings(input_embeddings)
     reference_embeddings = _sanitize_embeddings(reference_embeddings)
     sims = np.clip(np.dot(input_embeddings, reference_embeddings.T), -1.0, 1.0)
@@ -155,21 +168,37 @@ def _classify_by_nearest_neighbor(input_embeddings, reference_embeddings, labels
         result_labels.append(labels[top_indices[0]])
     return result_labels
 
+
+def _encode_and_cluster(descriptions: list[str], entity_names: list[str], relationships: list[dict]):
+    """Embed + cluster in one executor-safe function (no async allowed here)."""
+    embeddings = _sanitize_embeddings(np.array(get_embed_model().encode(descriptions)))
+    labels = _compute_spectral_labels(embeddings, entity_names, relationships)
+    return embeddings, labels
+
+
+def _encode_texts(texts: list[str]) -> np.ndarray:
+    """Embed a list of texts — executor-safe."""
+    return np.array(get_embed_model().encode(texts))
+
+
 # ============================================================================
-# Entity alignment
+# Entity alignment — async wrappers around CPU/IO work
 # ============================================================================
 
-def _prepare_and_cluster_entities(nearby_text_entities, nearby_relationships):
+async def _prepare_and_cluster_entities(nearby_text_entities, nearby_relationships):
+    """Async: dispatches embedding + clustering to the thread-pool executor."""
     if not nearby_text_entities:
         return np.array([]), []
     descriptions = [e["description"] for e in nearby_text_entities]
     entity_names = [e["entity_name"] for e in nearby_text_entities]
-    embeddings = _sanitize_embeddings(np.array(get_embed_model().encode(descriptions)))
-    labels = _compute_spectral_labels(embeddings, entity_names, nearby_relationships)
+    loop = asyncio.get_event_loop()
+    embeddings, labels = await loop.run_in_executor(
+        None, partial(_encode_and_cluster, descriptions, entity_names, nearby_relationships)
+    )
     return embeddings, labels
 
 
-def align_single_image_entity(img_entity_name, text_chunks, working_dir: str | None = None):
+async def align_single_image_entity(img_entity_name, text_chunks, working_dir: str | None = None):
     image_data  = get_image_data(working_dir)
     entity_info = image_data.get(img_entity_name, {})
     image_path  = entity_info.get("image_path")
@@ -177,36 +206,57 @@ def align_single_image_entity(img_entity_name, text_chunks, working_dir: str | N
     chunk_index = entity_info.get("chunk_order_index", 0)
     nearby_chunks = get_nearby_chunks(text_chunks, chunk_index)
     entity_types  = [t.upper() for t in PROMPTS["DEFAULT_ENTITY_TYPES"]]
+
+    if not image_path or not os.path.exists(image_path):
+        logger.warning(
+            "⚠️ [align_single_image_entity] image file missing for '%s': %s",
+            img_entity_name, image_path,
+        )
+        return None
+
     with open(image_path, "rb") as f:
         img_base = base64.b64encode(f.read()).decode("utf-8")
     prompt = PROMPTS["image_entity_alignment_user"].format(
         entity_type=entity_types, img_entity=img_entity_name,
         img_entity_description=description, chunk_text=nearby_chunks
     )
-    return normalize_to_json(get_mmllm_response(prompt, PROMPTS["image_entity_alignment_system"], img_base))
+    return normalize_to_json(
+        await get_mmllm_response(prompt, PROMPTS["image_entity_alignment_system"], img_base)
+    )
 
 
-def get_possible_entities_image_clustering(image_entity_description, nearby_text_entities, nearby_relationships):
+async def get_possible_entities_image_clustering(
+    image_entity_description, nearby_text_entities, nearby_relationships
+):
     if not nearby_text_entities:
         return []
-    embeddings, labels = _prepare_and_cluster_entities(nearby_text_entities, nearby_relationships)
+    embeddings, labels = await _prepare_and_cluster_entities(nearby_text_entities, nearby_relationships)
     if embeddings.size == 0:
         return []
-    input_embedding = get_embed_model().encode([image_entity_description])
+    loop = asyncio.get_event_loop()
+    input_embedding = await loop.run_in_executor(
+        None, partial(_encode_texts, [image_entity_description])
+    )
     target_label = _classify_by_nearest_neighbor(input_embedding, embeddings, labels, n_neighbors=3)[0]
     return [e for e, label in zip(nearby_text_entities, labels, strict=False) if label == target_label]
 
 
-def get_possible_entities_text_clustering(filtered_image_entities, nearby_text_entities, nearby_relationships):
+async def get_possible_entities_text_clustering(
+    filtered_image_entities, nearby_text_entities, nearby_relationships
+):
     if not nearby_text_entities:
         return [], []
-    embeddings, labels = _prepare_and_cluster_entities(nearby_text_entities, nearby_relationships)
+    embeddings, labels = await _prepare_and_cluster_entities(nearby_text_entities, nearby_relationships)
     if embeddings.size == 0:
         return [], []
     image_entity_with_labels = []
     if filtered_image_entities:
-        img_embeddings = get_embed_model().encode([e["description"] for e in filtered_image_entities])
-        img_labels     = _classify_by_nearest_neighbor(img_embeddings, embeddings, labels)
+        loop = asyncio.get_event_loop()
+        img_embeddings = await loop.run_in_executor(
+            None,
+            partial(_encode_texts, [e["description"] for e in filtered_image_entities]),
+        )
+        img_labels = _classify_by_nearest_neighbor(img_embeddings, embeddings, labels)
         for entity, label in zip(filtered_image_entities, img_labels, strict=False):
             image_entity_with_labels.append({
                 "entity_name": entity["entity_name"], "label": label,
@@ -215,26 +265,25 @@ def get_possible_entities_text_clustering(filtered_image_entities, nearby_text_e
     text_clustering_results = []
     for label in set(labels):
         cluster_entities = [
-            {
-                "entity_name": entity["entity_name"],
-                "entity_type": entity["entity_type"],
-                "description": entity["description"],
-            }
-            for entity, cluster_label in zip(nearby_text_entities, labels, strict=False)
+            {"entity_name": e["entity_name"], "entity_type": e["entity_type"], "description": e["description"]}
+            for e, cluster_label in zip(nearby_text_entities, labels, strict=False)
             if cluster_label == label
         ]
         text_clustering_results.append({"label": label, "entities": cluster_entities})
     return image_entity_with_labels, text_clustering_results
 
 
-def judge_image_entity_alignment(image_entity_name, image_entity_description, possible_entities, nearby_chunks):
+async def judge_image_entity_alignment(
+    image_entity_name, image_entity_description, possible_entities, nearby_chunks
+):
     prompt = PROMPTS["image_entity_judgement_user"].format(
         img_entity=image_entity_name, img_entity_description=image_entity_description,
         possible_matched_entities=possible_entities, chunk_text=nearby_chunks
     )
-    return get_llm_response(prompt, PROMPTS["image_entity_judgement_system"])
+    return await get_llm_response(prompt, PROMPTS["image_entity_judgement_system"])
 
-def judge_text_entity_alignment_clustering(image_entity_with_labels, text_clustering_results):
+
+async def judge_text_entity_alignment_clustering(image_entity_with_labels, text_clustering_results):
     clusters_info = [
         {"label": c["label"], "text_entities": [
             {"entity_name": e["entity_name"], "entity_type": e["entity_type"], "description": e["description"]}
@@ -270,20 +319,25 @@ Instruction:
     }}
 Include only one JSON list as the output, strictly following the structure above.
 """
-    prompt_system = """You are an AI assistant skilled in aligning entities based on semantic descriptions and cluster information. Use the provided instructions to merge entities accurately."""
-    merged_entities = get_llm_response(cur_prompt=prompt_user, system_content=prompt_system)
-    normalized      = normalize_to_json_list(merged_entities)
+    prompt_system = "You are an AI assistant skilled in aligning entities based on semantic descriptions and cluster information. Use the provided instructions to merge entities accurately."
+    merged_entities = await get_llm_response(cur_prompt=prompt_user, system_content=prompt_system)
+    normalized = normalize_to_json_list(merged_entities)
     return [i for i in normalized if i.get("source_image_entities") and i.get("source_text_entities")]
 
 # ============================================================================
-# Image entity operations
+# Image entity operations — all now async
 # ============================================================================
 
 def extract_image_entities(img_entity_name, working_dir: str | None = None):
+    """Synchronous XML parse — safe to call from async context (no I/O wait)."""
     base = working_dir or parameter.WORKING_DIR
     path = os.path.join(base, f"images/{img_entity_name}/graph_{img_entity_name}_entity_relation.graphml")
     if not os.path.exists(path):
-        logger.warning(f"⚠️  GraphML file not found: {path}")
+        logger.warning(
+            "⚠️ [extract_image_entities] GraphML not found for '%s': %s — "
+            "image entities will be missing from the graph.",
+            img_entity_name, path,
+        )
         return []
     tree = ET.parse(path)
     root = tree.getroot()
@@ -293,48 +347,81 @@ def extract_image_entities(img_entity_name, working_dir: str | None = None):
         entity_name = (node.get("id") or "").strip('"')
         entity_type = description = ""
         for data in node.findall("graphml:data", ns):
-            key = data.get("key")
+            key  = data.get("key")
             text = (data.text or "").strip('"')
             if key == "d0":
                 entity_type = text
             elif key == "d1":
                 description = text
         entities.append({"entity_name": entity_name, "entity_type": entity_type, "description": description})
+
+    empty_desc = [e["entity_name"] for e in entities if not e.get("description")]
+    if empty_desc:
+        logger.warning(
+            "⚠️ [extract_image_entities] %d entity/entities have empty descriptions "
+            "for image '%s': %s — graph quality may be reduced.",
+            len(empty_desc), img_entity_name, empty_desc[:5],
+        )
     return entities
 
 
-def enhance_image_entities(image_entities, nearby_chunks):
+async def enhance_image_entities(image_entities, nearby_chunks):
     prompt = PROMPTS["enhance_image_entity_user"].format(
         enhanced_image_entity_list=image_entities, chunk_text=nearby_chunks
     )
-    return normalize_to_json_list(get_llm_response(prompt, PROMPTS["enhance_image_entity_system"]))
+    return normalize_to_json_list(
+        await get_llm_response(prompt, PROMPTS["enhance_image_entity_system"])
+    )
 
 
-def image_knowledge_graph_alignment(image_entity_name, working_dir: str | None = None):
+async def image_knowledge_graph_alignment(image_entity_name, working_dir: str | None = None):
     image_data  = get_image_data(working_dir)
     chunk_kg    = get_chunk_knowledge_graph(working_dir)
     chunk_index = image_data[image_entity_name].get("chunk_order_index", 0)
     image_entities  = extract_image_entities(image_entity_name, working_dir)
+
+    if not image_entities:
+        logger.warning(
+            "⚠️ [image_knowledge_graph_alignment] No entities extracted for image '%s' — "
+            "alignment will be skipped.",
+            image_entity_name,
+        )
+        return []
+
     filtered        = [e for e in image_entities if e["entity_type"] not in ["ORI_IMG", "IMG"]]
     nearby_entities = get_nearby_entities(chunk_kg, chunk_index)
     nearby_rels     = get_nearby_relationships(chunk_kg, chunk_index)
-    img_with_labels, text_clusters = get_possible_entities_text_clustering(filtered, nearby_entities, nearby_rels)
-    return judge_text_entity_alignment_clustering(img_with_labels, text_clusters)
+    img_with_labels, text_clusters = await get_possible_entities_text_clustering(
+        filtered, nearby_entities, nearby_rels
+    )
+    return await judge_text_entity_alignment_clustering(img_with_labels, text_clusters)
 
 
-def enhanced_image_knowledge_graph(aligned_entities, image_entity_name, working_dir: str | None = None):
-    base         = working_dir or parameter.WORKING_DIR
-    image_data   = get_image_data(working_dir)
-    text_chunks  = get_text_chunks(working_dir)
-    img_kg_path  = os.path.join(base, f"images/{image_entity_name}/graph_{image_entity_name}_entity_relation.graphml")
+async def enhanced_image_knowledge_graph(aligned_entities, image_entity_name, working_dir: str | None = None):
+    base          = working_dir or parameter.WORKING_DIR
+    image_data    = get_image_data(working_dir)
+    text_chunks   = get_text_chunks(working_dir)
+    img_kg_path   = os.path.join(base, f"images/{image_entity_name}/graph_{image_entity_name}_entity_relation.graphml")
     enhanced_path = os.path.join(base, f"images/{image_entity_name}/enhanced_graph_{image_entity_name}_entity_relation.graphml")
     image_entities = extract_image_entities(image_entity_name, working_dir)
     filtered       = [e for e in image_entities if e["entity_type"] not in ["ORI_IMG", "IMG"]]
     chunk_index    = image_data[image_entity_name].get("chunk_order_index", 0)
     nearby_chunks  = get_nearby_chunks(text_chunks, chunk_index)
-    aligned_image_names = [e.get("source_image_entities", [None])[0] for e in aligned_entities if e.get("source_image_entities")]
+    aligned_image_names = [
+        e.get("source_image_entities", [None])[0]
+        for e in aligned_entities
+        if e.get("source_image_entities")
+    ]
     to_enhance = [e for e in filtered if e["entity_name"] not in aligned_image_names]
-    enhanced   = enhance_image_entities(to_enhance, nearby_chunks)
+    enhanced   = await enhance_image_entities(to_enhance, nearby_chunks)
+
+    if not enhanced:
+        logger.warning(
+            "⚠️ [enhanced_image_knowledge_graph] No entities enhanced for image '%s' — "
+            "using original image KG without enhancement.",
+            image_entity_name,
+        )
+
     G = nx.read_graphml(img_kg_path)
     for entity in enhanced:
         original_name = entity.get("original_name")
@@ -349,30 +436,50 @@ def enhanced_image_knowledge_graph(aligned_entities, image_entity_name, working_
     nx.write_graphml(G, enhanced_path)
     return enhanced_path
 
-def image_knowledge_graph_update(enhanced_path, image_entity_name, working_dir: str | None = None):
+
+async def image_knowledge_graph_update(enhanced_path, image_entity_name, working_dir: str | None = None):
     base        = working_dir or parameter.WORKING_DIR
     image_data  = get_image_data(working_dir)
     text_chunks = get_text_chunks(working_dir)
     chunk_kg    = get_chunk_knowledge_graph(working_dir)
     new_path    = os.path.join(base, f"images/{image_entity_name}/new_graph_{image_entity_name}_entity_relation.graphml")
 
-    image_entity    = align_single_image_entity(image_entity_name, text_chunks, working_dir)
+    image_entity    = await align_single_image_entity(image_entity_name, text_chunks, working_dir)
     chunk_index     = image_data[image_entity_name].get("chunk_order_index", 0)
     nearby_chunks   = get_nearby_chunks(text_chunks, chunk_index)
     nearby_entities = get_nearby_entities(chunk_kg, chunk_index)
     nearby_rels     = get_nearby_relationships(chunk_kg, chunk_index)
 
     if not image_entity:
+        logger.warning(
+            "⚠️ [image_knowledge_graph_update] align_single_image_entity returned nothing "
+            "for '%s' — skipping KG update, using enhanced path as-is.",
+            image_entity_name,
+        )
         return enhanced_path
+
     entity_name = image_entity.get("entity_name", "no_match")
     entity_desc = image_entity.get("description", "")
     if entity_name.lower().replace(" ", "") in ["no_match", "nomatch"]:
+        logger.warning(
+            "⚠️ [image_knowledge_graph_update] LLM returned 'no_match' for image entity "
+            "'%s' — skipping KG update.",
+            image_entity_name,
+        )
         return enhanced_path
 
-    possible_matches = get_possible_entities_image_clustering(entity_desc, nearby_entities, nearby_rels)
-    matched_name     = judge_image_entity_alignment(entity_name, entity_desc, possible_matches, nearby_chunks)
+    possible_matches = await get_possible_entities_image_clustering(
+        entity_desc, nearby_entities, nearby_rels
+    )
+    matched_name = await judge_image_entity_alignment(
+        entity_name, entity_desc, possible_matches, nearby_chunks
+    )
     if not matched_name or not matched_name.strip():
-        logger.warning(f"⚠️  Could not match image entity: {entity_name}")
+        logger.warning(
+            "⚠️ [image_knowledge_graph_update] Could not match image entity '%s' to any "
+            "text entity — skipping update.",
+            entity_name,
+        )
         return enhanced_path
 
     matched_normalized = matched_name.strip().replace(" ", "").replace("\\", "").lower()
@@ -383,7 +490,11 @@ def image_knowledge_graph_update(enhanced_path, image_entity_name, working_dir: 
             source_node = node
             break
     if source_node is None:
-        logger.warning("ORI_IMG node not found")
+        logger.warning(
+            "⚠️ [image_knowledge_graph_update] ORI_IMG/UNKNOWN node not found in '%s' "
+            "— skipping update.",
+            enhanced_path,
+        )
         return enhanced_path
 
     edges = list(G.edges(data=True))
@@ -400,25 +511,38 @@ def image_knowledge_graph_update(enhanced_path, image_entity_name, working_dir: 
         if ename.strip().replace(" ", "").replace("\\", "").lower() == matched_normalized:
             matched = True
             quoted_name = ensure_quoted(ename)
-            G.add_node(quoted_name, entity_type=entity["entity_type"], description=entity["description"], source_id=source_id)
-            G.add_edge(source_node, quoted_name, weight=10.0, description=f"{source_node} is the image of {ename}.", source_id=source_id, order=order)
+            G.add_node(quoted_name, entity_type=entity["entity_type"],
+                       description=entity["description"], source_id=source_id)
+            G.add_edge(source_node, quoted_name, weight=10.0,
+                       description=f"{source_node} is the image of {ename}.",
+                       source_id=source_id, order=order)
             break
 
     if not matched:
+        # IMG_ENTITY fallback — node still gets into the graph but with a clear warning
+        logger.warning(
+            "⚠️ [image_knowledge_graph_update] No exact text-entity match for '%s' — "
+            "inserting IMG_ENTITY fallback node. This node will have no text-graph connections "
+            "and may reduce graph quality for queries about this image.",
+            entity_name,
+        )
         G.add_node(entity_name, entity_type="IMG_ENTITY", description=entity_desc, source_id=source_id)
-        G.add_edge(source_node, entity_name, weight=10.0, description=f"{source_node} is the image of {entity_name}.", source_id=source_id, order=order)
+        G.add_edge(source_node, entity_name, weight=10.0,
+                   description=f"{source_node} is the image of {entity_name}.",
+                   source_id=source_id, order=order)
 
     nx.write_graphml(G, new_path)
     return new_path
 
 
 def merge_graphs(image_graph_path, text_graph_path, aligned_entities, image_entity_name, working_dir: str | None = None):
+    """Pure graph manipulation — no LLM calls, safe to call from async context."""
     base         = working_dir or parameter.WORKING_DIR
     merged_path  = os.path.join(base, f"graph_merged_{image_entity_name}.graphml")
     image_graph  = nx.read_graphml(image_graph_path)
     text_graph   = nx.read_graphml(text_graph_path)
     if image_graph is None or text_graph is None:
-        logger.error("❌ Failed to load graphs")
+        logger.error("❌ Failed to load graphs for merge")
         return text_graph_path
     merged = nx.compose(image_graph, text_graph)
     for entity_info in aligned_entities:
@@ -440,7 +564,7 @@ def merge_graphs(image_graph_path, text_graph_path, aligned_entities, image_enti
             for neighbor in list(merged.neighbors(normalized_entity)):
                 if not merged.has_edge(target, neighbor):
                     merged.add_edge(target, neighbor)
-                edge_data = merged.get_edge_data(normalized_entity, neighbor)
+                edge_data        = merged.get_edge_data(normalized_entity, neighbor)
                 target_edge_data = merged.get_edge_data(target, neighbor)
                 if target_edge_data:
                     for key in edge_data:
@@ -451,12 +575,16 @@ def merge_graphs(image_graph_path, text_graph_path, aligned_entities, image_enti
             merged.remove_node(normalized_entity)
         if target not in merged.nodes:
             merged.add_node(target)
-        merged.nodes[target].update({"entity_type": entity_info["entity_type"], "description": entity_info["description"], "source_id": combined_source_id})
+        merged.nodes[target].update({
+            "entity_type": entity_info["entity_type"],
+            "description": entity_info["description"],
+            "source_id":   combined_source_id,
+        })
         new_name = ensure_quoted(entity_info["entity_name"])
         if new_name != target:
             merged = nx.relabel_nodes(merged, {target: new_name})
     nx.write_graphml(merged, merged_path)
-    logger.info(f"🔗 Graph fusion complete: {merged_path}")
+    logger.info("🔗 Graph fusion complete: %s", merged_path)
     return merged_path
 
 
@@ -467,25 +595,23 @@ def merge_graphs(image_graph_path, text_graph_path, aligned_entities, image_enti
 async def fusion(img_ids: list[str], working_dir: str | None = None) -> str:
     """Run cross-modal graph fusion for all image entity IDs.
 
-    Parameters
-    ----------
-    img_ids:
-        List of image entity names to fuse into the text graph.
-    working_dir:
-        Workspace-scoped working directory. Defaults to global WORKING_DIR
-        if not supplied (legacy / CLI usage).
+    All LLM calls and CPU-bound embedding/clustering are now properly
+    async — nothing blocks the event loop.
     """
     base       = working_dir or parameter.WORKING_DIR
     graph_path = os.path.join(base, "graph_chunk_entity_relation.graphml")
     if not img_ids:
         return graph_path
+
     for image_name in tqdm(img_ids, desc="🔗 Graph fusion", unit="image"):
         merged_path = os.path.join(base, f"graph_merged_{image_name}.graphml")
         if os.path.exists(merged_path):
             graph_path = merged_path
             continue
-        aligned       = image_knowledge_graph_alignment(image_name, working_dir)
-        enhanced_path = enhanced_image_knowledge_graph(aligned, image_name, working_dir)
-        updated_path  = image_knowledge_graph_update(enhanced_path, image_name, working_dir)
+
+        aligned       = await image_knowledge_graph_alignment(image_name, working_dir)
+        enhanced_path = await enhanced_image_knowledge_graph(aligned, image_name, working_dir)
+        updated_path  = await image_knowledge_graph_update(enhanced_path, image_name, working_dir)
         graph_path    = merge_graphs(updated_path, graph_path, aligned, image_name, working_dir)
+
     return graph_path
