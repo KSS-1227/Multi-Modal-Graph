@@ -192,6 +192,8 @@ async def create_workspace(owner_id: str, name: str) -> dict:
         "workspace_id": workspace_id,
         "name": name,
         "created_at": now.isoformat(),
+        "updated_at": now.isoformat(),
+        "owner_id": owner_id,
         "member_count": 1,
         "role": "Admin",
     }
@@ -240,7 +242,7 @@ async def list_workspaces(user_id: str) -> list[dict]:
     try:
         workspaces_result = (
             await supabase.from_("workspaces")
-            .select("workspace_id, name, created_at")
+            .select("workspace_id, name, created_at, updated_at, owner_id")
             .in_("workspace_id", workspace_ids)
             .eq("is_deleted", False)
             .execute()
@@ -281,6 +283,8 @@ async def list_workspaces(user_id: str) -> list[dict]:
                 "workspace_id": wid,
                 "name": ws["name"],
                 "created_at": ws["created_at"],
+                "updated_at": ws["updated_at"],
+                "owner_id": ws["owner_id"],
                 "member_count": member_count_map.get(wid, 0),
                 "role": role_by_workspace.get(wid, "Viewer"),
             }

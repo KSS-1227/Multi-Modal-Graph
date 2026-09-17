@@ -1,5 +1,12 @@
 -- CockroachDB storage schema for workspace-scoped documents, graph data,
 -- vector retrieval, and conversational memory.
+--
+-- NOTE: CockroachDB does not support native VECTOR type.
+-- Embeddings are stored as JSONB arrays instead.
+-- Vector similarity search is handled by the application layer.
+
+-- CockroachDB storage schema for workspace-scoped documents, graph data,
+-- vector retrieval, and conversational memory.
 
 CREATE TABLE IF NOT EXISTS documents (
     workspace_id UUID NOT NULL,
@@ -35,13 +42,14 @@ CREATE TABLE IF NOT EXISTS graph_edges (
 CREATE TABLE IF NOT EXISTS entity_embeddings (
     workspace_id UUID NOT NULL,
     node_id STRING NOT NULL,
-    embedding VECTOR(384) NOT NULL,
+    embedding JSONB NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (workspace_id, node_id)
 );
 
-CREATE VECTOR INDEX IF NOT EXISTS entity_embeddings_vector_idx
-    ON entity_embeddings (workspace_id, embedding);
+-- Vector indexing handled by application layer (pgvector alternative)
+CREATE INDEX IF NOT EXISTS idx_entity_embeddings_workspace_node
+    ON entity_embeddings (workspace_id, node_id);
 
 CREATE TABLE IF NOT EXISTS agent_memory (
     workspace_id UUID NOT NULL,

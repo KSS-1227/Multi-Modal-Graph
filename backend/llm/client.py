@@ -70,11 +70,29 @@ async def _with_retry(coro_fn, max_retries: int = 6, base_delay: float = 10.0):
 # Embedding
 # ============================================================================
 
-@wrap_embedding_func_with_attrs(
-    embedding_dim=get_embed_model().get_sentence_embedding_dimension(),
-    max_token_size=get_embed_model().max_seq_length,
-)
+def _embedding_dim() -> int:
+    """Resolve embedding dimension lazily — avoids loading the model at import time."""
+    model = get_embed_model()
+    # sentence-transformers renamed get_sentence_embedding_dimension → get_embedding_dimension
+    if hasattr(model, "get_embedding_dimension"):
+        return model.get_embedding_dimension()
+    return model.get_sentence_embedding_dimension()
+
+
+def _embedding_max_seq() -> int:
+    return get_embed_model().max_seq_length
+
+
+# Use sentinel -1 for the decorator arguments so the EmbeddingFunc dataclass
+# is created without touching the model at import time.  The real values are
+# patched in on first call inside local_embedding().
+@wrap_embedding_func_with_attrs(embedding_dim=-1, max_token_size=-1)
 async def local_embedding(texts: list[str]) -> np.ndarray:
+    # Patch the wrapper attrs on first real call so callers that read
+    # .embedding_dim get the correct value after the model is loaded.
+    if local_embedding.embedding_dim == -1:
+        local_embedding.embedding_dim = _embedding_dim()
+        local_embedding.max_token_size = _embedding_max_seq()
     return get_embed_model().encode(texts)
 
 

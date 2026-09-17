@@ -11,7 +11,10 @@ logger = logging.getLogger(__name__)
 
 # Load .env BEFORE any os.environ.get() calls so env vars are available
 # regardless of import order (uvicorn reloader imports config before main.py).
-load_dotenv()
+from pathlib import Path as _Path
+_project_root = _Path(__file__).parent.parent.parent  # backend/config/settings.py -> project_root
+_backend_env = _project_root / "backend" / ".env"
+load_dotenv(dotenv_path=str(_backend_env))
 
 # ============ LLM Configuration ============
 # One server-side OpenAI API key powers text, vision, and transcription.

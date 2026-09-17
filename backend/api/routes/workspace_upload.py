@@ -49,6 +49,7 @@ def _sanitize(name: str) -> str:
     return name or "unnamed_file"
 
 
+@router.post("")
 @router.post("/")
 async def upload_documents(
     files: list[UploadFile] = File(...),
